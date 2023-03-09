@@ -1,0 +1,253 @@
+#include <WiFi.h>
+#include "ThingSpeak.h"
+#include <WiFiUdp.h>
+#include <NTPClient.h>               
+#include <TimeLib.h> 
+#include <LiquidCrystal_PCF8574.h>
+#include <Adafruit_ADS1X15.h>
+#include <Filters.h> 
+
+#define SCT_DET 17 
+#define YFS401 16  
+
+const char* ssid = "My sam S8";   // your network SSID (name) 
+const char* password = "agesldwaw1";   // your network password
+
+const float FACTOR = 50;
+const float multiplier = 0.0825F;//0.2527F;//0.0625F
+float IRMS, P;
+bool SCT_flag = 1;
+
+float calibrationFactor = 90; //You can change according to your datasheet
+volatile byte pulseCount =0;  
+float flowRate = 0.0;
+unsigned int flowMilliLitres =0;
+unsigned long totalMilliLitres = 0;
+bool YFS_flag = 1;
+
+unsigned long ChannelNumber = 2058553;
+const char * WriteAPIKey = "YHSFZ0TC8CPU3W7W";
+const char * readAPIKey = "34W6LGLIFXD56MPM"; 
+
+char Time[ ] = "TIME:00:00:00";
+char Date[ ] = "DATE:00/00/2000";
+byte last_second, second_, minute_, hour_, day_, month_;
+int year_;
+
+int state = 1;
+unsigned long previousMillis = 0;
+bool sweepdir = 1;
+
+void pulseCounter(void);
+float Irm(void);
+void lcdsweep(void);
+void Tspk_Update(int);
+void LCDDISPLAY(int);
+
+WiFiClient  client;
+WiFiUDP ntpUDP;
+LiquidCrystal_PCF8574 lcd(0x3F);
+Adafruit_ADS1115 ADS;
+NTPClient timeClient(ntpUDP, "asia.pool.ntp.org", 19800, 60000);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(SCT_DET,INPUT);  //Define the pin mode
+  pinMode(YFS401,INPUT);
+  digitalWrite(YFS401, HIGH);
+  lcd.begin(16, 2);  // initialize the lcd
+  WiFi.mode(WIFI_STA);
+  if(WiFi.status() != WL_CONNECTED){
+    Serial.print("Attempting to connect");
+    while(WiFi.status() != WL_CONNECTED){
+      WiFi.begin(ssid, password); 
+      delay(2000);     
+    } 
+    Serial.println("\nConnected.");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP()); 
+  }
+  ThingSpeak.begin(client);
+  timeClient.begin();
+  ADS.setGain(GAIN_TWO);
+  ADS.begin();
+  // put your setup code here, to run once:
+
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+
+  if(digitalRead(SCT_DET)){
+    SCT_flag = 1;
+    IRMS = Irms();
+    P = 230.0 * IRMS;
+    Serial.print("Average RMS Current: ");
+    Serial.print(IRMS, 3);
+    Serial.print(" A.\t\t");
+    Serial.print("Power:");
+    Serial.print(P, 3);
+    Serial.println(" W");
+  }
+  else{
+    Serial.print("SCT disconnected");
+    SCT_flag = 0;
+  }  
+  LCDDISPLAY(1);
+  Tspk_Update(ThingSpeak.writeField(ChannelNumber, 1, IRMS, WriteAPIKey));
+
+  attachInterrupt(digitalPinToInterrupt(YFS401), pulseCounter, FALLING);
+  delay(1000);
+  detachInterrupt(digitalPinToInterrupt(YFS401));
+  flowRate = ((1000.0 / (millis() - previousMillis)) * pulseCount) / calibrationFactor;
+  previousMillis = millis(); 
+  flowMilliLitres = (flowRate   / 60) * 2000;
+  //totalMilliLitres += flowMilliLitres;
+  LCDDISPLAY(2);
+  Tspk_Update(ThingSpeak.writeField(ChannelNumber, 2, flowRate, WriteAPIKey));
+  pulseCount = 0;
+
+  // Serial.print(Amps_TRMS);
+  Serial.print(",");
+  Serial.println(flowRate);
+
+    
+}
+
+void pulseCounter(){  // ISR for YFS
+  pulseCount++;
+}
+
+float Irms(){ // ISR for SCT100
+  float voltage, Curr_temp;
+  float Curr_sum = 0;
+  long t_start = millis();
+  uint8_t counter = 0;
+  while (millis() - t_start < 500){
+    voltage = ADS.readADC_Differential_0_1() * multiplier;
+    //Serial.println(voltage);
+    Curr_temp = voltage * FACTOR;
+    Curr_temp /= 1000.0;
+    Curr_sum += sq(Curr_temp);
+    counter = counter +1;
+    delay(4);
+  }
+  // Serial.print("Samples taken for IRMS:");
+  // Serial.println(counter);
+  return(sqrt(Curr_sum / counter));
+}
+
+void LCDDISPLAY(int a){
+  lcdsweep();
+  switch(a){
+    case 1:
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("IRMS -> ");
+      lcd.print(IRMS);
+      lcd.print("A");
+      lcd.setCursor(0,1);
+      lcd.print("POWER -> ");
+      lcd.setCursor(6, 1);
+      lcd.print(flowRate);
+      lcd.setCursor(6, 1);
+      lcd.print("W");
+      break;
+    case 2:
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print(" Flow Rate");
+      lcd.setCursor(1,1);
+      lcd.print(flowRate);
+      lcd.setCursor(6, 1);
+      lcd.print("L/Min");
+      break;
+    case 3:
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print(" Mass Flow ");
+      lcd.setCursor(1,1);
+      // lcd.print(GasRate);
+      lcd.setCursor(6, 1);
+      lcd.print("SCCM");
+      break;
+    case 4:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(Time);
+      lcd.setCursor(0, 1);
+      lcd.print(Date);
+      break;
+    case 5:
+      lcd.clear();
+      lcd.setCursor(0,0);
+      // lcd.print(" Flow Rate"); Exceptions here
+      // lcd.setCursor(1,1);
+      // lcd.print(GasRate);
+      // lcd.setCursor(6, 1);
+      // lcd.print("SCCM");
+      break;
+    default:
+      lcd.clear();
+      break;
+  }
+  
+}
+
+void Tspk_Update(int STATUS){
+  if(STATUS == 200){
+      Serial.println("Channel update successful.");
+    }
+    else{
+      Serial.println("Problem updating channel. HTTP error code " + String(STATUS));
+    }
+}
+
+void lcdsweep(){
+  if(sweepdir == 1){
+   for(short i=0; i<=16; i++){     // Performs the shifting function
+      lcd.print(F(" "));
+      lcd.setCursor(i,0);
+      lcd.print(F(" "));
+      lcd.setCursor(i,1);
+      delay(20);
+    }
+    sweepdir = 0;
+  }
+  else{
+    for(short i=16; i>=0; i--){     // Performs the shifting function
+      lcd.print(F(" "));
+      lcd.setCursor(i,0);
+      lcd.print(F(" "));
+      lcd.setCursor(i,1);
+      delay(20);
+    }
+    sweepdir = 1;
+  }
+}
+
+void time_update(){
+  timeClient.update();
+  unsigned long unix_epoch = timeClient.getEpochTime();    // Get Unix epoch time from the NTP server
+  second_ = second(unix_epoch);
+ 
+  minute_ = minute(unix_epoch);
+  hour_   = hour(unix_epoch);
+  day_    = day(unix_epoch);
+  month_  = month(unix_epoch);
+  year_   = year(unix_epoch);
+
+  Time[12] = second_ % 10 + 48;
+  Time[11] = second_ / 10 + 48;
+  Time[9]  = minute_ % 10 + 48;
+  Time[8]  = minute_ / 10 + 48;
+  Time[6]  = hour_   % 10 + 48;
+  Time[5]  = hour_   / 10 + 48;
+
+  Date[5]  = day_   / 10 + 48;
+  Date[6]  = day_   % 10 + 48;
+  Date[8]  = month_  / 10 + 48;
+  Date[9]  = month_  % 10 + 48;
+  Date[13] = (year_   / 10) % 10 + 48;
+  Date[14] = year_   % 10 % 10 + 48;
+}
